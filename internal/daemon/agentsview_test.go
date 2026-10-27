@@ -59,7 +59,7 @@ func TestAgentsViewWorkerAndReconciliation(t *testing.T) {
 	candidate, err := tc.DB.GetTokenCostCandidate(candidateJob.ID)
 	require.NoError(t, err)
 	require.NotNil(t, candidate)
-	resolved, err := tc.Pool.reconcileTokenCostCandidate(t.Context(), *candidate)
+	resolved, err := tc.Pool.reconcileTokenCostCandidate(t.Context(), *candidate, tc.Pool.fetchTokenUsage)
 	require.NoError(t, err)
 	assert.True(t, resolved)
 	updated, err = tc.DB.GetJobByID(candidateJob.ID)
