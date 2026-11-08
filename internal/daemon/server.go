@@ -58,6 +58,12 @@ type Server struct {
 	search                  reviewSearcher
 	searchReconciler        searchReconciler
 	searchNow               func() time.Time
+	autoDesignScanMu        sync.Mutex
+	autoDesignScanAt        time.Time
+	autoDesignScanEnabled   bool
+	autoDesignScanRunning   bool
+	autoDesignScanStopped   bool
+	autoDesignScanDBWG      sync.WaitGroup
 	searchMu                sync.Mutex
 	searchCancel            context.CancelFunc
 	searchSubscriberID      int
@@ -117,10 +123,6 @@ type Server struct {
 	goalWatchDone           chan struct{}
 	postCommitScheduler     *postCommitScheduler
 	goalGate                *goalGate
-
-	// Cached machine ID to avoid INSERT on every status request
-	machineIDMu sync.Mutex
-	machineID   uuid.UUID
 }
 
 const dailyTelemetryInterval = 24 * time.Hour
@@ -422,6 +424,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// Start worker pool before advertising availability.
 	s.workerPool.Start()
 	s.startSearch(ctx)
+	s.startAutoDesignRepoScan()
 
 	ready, serveExited, err := waitForServerReady(ctx, ep, 2*time.Second, serveErrCh, s.startupAuth())
 	if err != nil {
@@ -741,6 +744,8 @@ func (s *Server) Stop() error {
 }
 
 func (s *Server) stopOnce0() error {
+	s.stopAutoDesignRepoScan()
+
 	// Log daemon stop before shutting down components
 	if s.activityLog != nil {
 		uptime := time.Since(s.startTime)
@@ -1398,23 +1403,13 @@ func reusableSessionTarget(gitRef string) string {
 	return strings.TrimSpace(gitRef)
 }
 
-// getMachineID returns the cached machine ID, fetching it on first successful call.
-// Retries on each call until successful to handle transient DB errors.
+// getMachineID returns the machine ID, or nil when it is unavailable.
 func (s *Server) getMachineID() *uuid.UUID {
-	s.machineIDMu.Lock()
-	defer s.machineIDMu.Unlock()
-
-	if s.machineID != uuid.Nil() {
-		return &s.machineID
-	}
-
-	if id, err := s.db.GetMachineID(); err == nil && id != uuid.Nil() {
-		s.machineID = id
-	}
-	if s.machineID == uuid.Nil() {
+	id, err := s.db.GetMachineID()
+	if err != nil || id == uuid.Nil() {
 		return nil
 	}
-	return &s.machineID
+	return &id
 }
 
 func jobLogSafeEnd(f *os.File, fileSize int64, jsonl bool) int64 {
@@ -1885,6 +1880,9 @@ func (s *Server) humaListJobs(
 	// FilteredStats below carries the exact closed-filtered counts for browser
 	// views that need counts matching the visible rows.
 	statsOpts := remoteJobOptions(ctx)
+	if input.IncludeTotals == "true" {
+		statsOpts = append(statsOpts, storage.WithJobTotals())
+	}
 	// Panel expansion must not scan the entire queue for aggregate counts.
 	if input.PanelRun != uuid.Nil() {
 		statsOpts = append(statsOpts, storage.WithPanelRun(input.PanelRun))
@@ -1944,28 +1942,31 @@ func (s *Server) humaListJobs(
 		statsOpts,
 		storage.WithExcludePanelRole(storage.PanelRoleMember),
 	)
-	stats, statsErr := s.db.CountJobStats(input.Status, repo, statsOpts...)
-	if statsErr != nil {
-		log.Printf(
-			"Warning: failed to count job stats: %v", statsErr,
-		)
-	}
-	var filteredStats *storage.JobStats
-	if input.Closed == "true" || input.Closed == "false" {
-		filteredOpts := append(
-			append([]storage.ListJobsOption(nil), statsOpts...),
-			storage.WithClosed(input.Closed == "true"),
-		)
-		filtered, filteredErr := s.db.CountJobStats(
-			input.Status, repo, filteredOpts...,
-		)
-		if filteredErr != nil {
+	var stats, filteredStats *storage.JobStats
+	if input.OmitStats != "true" {
+		counted, statsErr := s.db.CountJobStats(input.Status, repo, statsOpts...)
+		if statsErr != nil {
 			log.Printf(
-				"Warning: failed to count closed-filtered job stats: %v",
-				filteredErr,
+				"Warning: failed to count job stats: %v", statsErr,
 			)
-		} else {
-			filteredStats = &filtered
+		}
+		stats = &counted
+		if input.Closed == "true" || input.Closed == "false" {
+			filteredOpts := append(
+				append([]storage.ListJobsOption(nil), statsOpts...),
+				storage.WithClosed(input.Closed == "true"),
+			)
+			filtered, filteredErr := s.db.CountJobStats(
+				input.Status, repo, filteredOpts...,
+			)
+			if filteredErr != nil {
+				log.Printf(
+					"Warning: failed to count closed-filtered job stats: %v",
+					filteredErr,
+				)
+			} else {
+				filteredStats = &filtered
+			}
 		}
 	}
 
@@ -1976,7 +1977,7 @@ func (s *Server) humaListJobs(
 	resp.Body.Jobs = jobs
 	resp.Body.HasMore = hasMore
 	resp.Body.NextCursor = nextCursor
-	resp.Body.Stats = &stats
+	resp.Body.Stats = stats
 	resp.Body.FilteredStats = filteredStats
 	return resp, nil
 }
@@ -3010,6 +3011,12 @@ func (s *Server) humaEnqueue(
 	ctx context.Context, input *EnqueueInput,
 ) (*RawJSONOutput, error) {
 	req := input.Body
+	if req.ReviewPrompt != "" {
+		if err := validateReviewPromptRequest(req); err != nil {
+			return rawJSONOutput(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+		}
+		req.Source = storage.JobSourceReviewPrompt
+	}
 	if req.ReviewType == config.ReviewTypeGoal {
 		return s.enqueueGoalReview(ctx, req)
 	}
@@ -3475,7 +3482,7 @@ func (s *Server) finishSingleEnqueue(
 	ctx context.Context, job *storage.ReviewJob,
 	agentName string, in singleAgentInputs,
 ) {
-	if job.JobType == storage.JobTypeReview &&
+	if in.req.ReviewPrompt == "" && job.JobType == storage.JobTypeReview &&
 		config.IsGeneralReviewType(in.req.ReviewType) {
 		if err := s.maybeDispatchAutoDesign(ctx, job); err != nil {
 			log.Printf("auto-design dispatch failed: %v", err)

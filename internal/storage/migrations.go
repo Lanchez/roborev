@@ -44,7 +44,77 @@ var schemaMigrations = []schemaMigration{
 	{8, "search change log", migrateSearchChanges},
 	{9, "cost aggregate index", migrateCostAggregateIndex},
 	{10, "open failed reviews index", migrateOpenFailedReviewsIndex},
-	{11, "rebuttal review version", migrateRebuttalReviewVersion},
+	{11, "CI panel run index", migrateCIPanelRunIndex},
+	{12, "queue list position indexes", migrateQueueListPositionIndexes},
+	{13, "queue stats closed state", migrateQueueStatsClosedState},
+	{14, "sync pending indexes", migrateSyncPendingIndexes},
+	{15, "rebuttal review version", migrateRebuttalReviewVersion},
+}
+
+func migrateSyncPendingIndexes(ctx context.Context, db *DB) error {
+	exists, err := hasColumn(ctx, db, "reviews", "job_synced_at")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE reviews ADD COLUMN job_synced_at TEXT`); err != nil {
+			return err
+		}
+	}
+	// Unsynced reviews are already pending; mirroring their jobs would add
+	// review writes to the first push. Remote jobs stay out after repeated pulls.
+	_, err = db.ExecContext(ctx, `
+		UPDATE reviews SET job_synced_at = (SELECT synced_at FROM review_jobs
+			WHERE id = reviews.job_id AND source_machine_id = (SELECT value FROM sync_state WHERE key = 'machine_id'))
+			WHERE synced_at IS NOT NULL;
+		CREATE TRIGGER IF NOT EXISTS review_job_synced_update AFTER UPDATE OF synced_at ON review_jobs BEGIN
+			UPDATE reviews SET job_synced_at = CASE WHEN NEW.source_machine_id = (SELECT value FROM sync_state WHERE key = 'machine_id')
+				THEN NEW.synced_at END WHERE job_id = NEW.id AND synced_at IS NOT NULL;
+		END;
+		CREATE INDEX IF NOT EXISTS idx_review_jobs_sync_pending ON review_jobs(source_machine_id, id) WHERE status IN ('done', 'failed', 'canceled', 'skipped', 'applied', 'rebased') AND uuid IS NOT NULL
+		AND (synced_at IS NULL OR `+sqliteNormalizedTimestampExpr("updated_at")+` > `+sqliteNormalizedTimestampExpr("synced_at")+`);
+		CREATE INDEX IF NOT EXISTS idx_reviews_sync_pending ON reviews(job_id) WHERE uuid IS NOT NULL
+		AND (synced_at IS NULL OR replace(rtrim(job_synced_at, 'Z'), ' ', 'T') > replace(rtrim(synced_at, 'Z'), ' ', 'T'));
+	`)
+	return err
+}
+
+func migrateQueueStatsClosedState(ctx context.Context, db *DB) error {
+	_, err := db.ExecContext(ctx, `DROP INDEX IF EXISTS idx_review_jobs_queue_stats;
+		CREATE INDEX idx_review_jobs_queue_stats ON review_jobs(status, repo_id, job_type, source, panel_role, review_closed)`)
+	return err
+}
+
+// migrateQueueListPositionIndexes's triggers keep review_jobs.review_closed equal to the job's reviews.closed.
+func migrateQueueListPositionIndexes(ctx context.Context, db *DB) error {
+	if _, err := db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_review_jobs_branch_position
+		ON review_jobs(branch, `+sqliteNormalizedTimestampExpr("enqueued_at")+` DESC, id DESC)`); err != nil {
+		return err
+	}
+	exists, err := hasColumn(ctx, db, "review_jobs", "review_closed")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE review_jobs ADD COLUMN review_closed INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	_, err = db.ExecContext(ctx, `
+		UPDATE review_jobs SET review_closed = 1 WHERE id IN (SELECT job_id FROM reviews WHERE closed = 1);
+		CREATE TRIGGER IF NOT EXISTS review_closed_insert AFTER INSERT ON reviews BEGIN
+			UPDATE review_jobs SET review_closed = NEW.closed WHERE id = NEW.job_id AND review_closed <> NEW.closed;
+		END;
+		CREATE TRIGGER IF NOT EXISTS review_closed_update AFTER UPDATE OF closed ON reviews BEGIN
+			UPDATE review_jobs SET review_closed = NEW.closed WHERE id = NEW.job_id AND review_closed <> NEW.closed;
+		END;
+		CREATE TRIGGER IF NOT EXISTS review_closed_delete AFTER DELETE ON reviews BEGIN
+			UPDATE review_jobs SET review_closed = 0 WHERE id = OLD.job_id AND review_closed <> 0;
+		END;
+		CREATE INDEX IF NOT EXISTS idx_review_jobs_closed_position
+		ON review_jobs(`+sqliteNormalizedTimestampExpr("enqueued_at")+` DESC, id DESC) WHERE review_closed = 1;
+	`)
+	return err
 }
 
 func migrateCostAggregateIndex(ctx context.Context, db *DB) error {
@@ -128,6 +198,12 @@ func migrateOpenFailedReviewsIndex(ctx context.Context, db *DB) error {
 func migrateCIPanelPRHeadIndex(ctx context.Context, db *DB) error {
 	_, err := db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_ci_panels_pr_head
 		ON ci_pr_panels(github_repo, pr_number, head_sha)`)
+	return err
+}
+
+func migrateCIPanelRunIndex(ctx context.Context, db *DB) error {
+	_, err := db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_ci_panels_panel_run
+		ON ci_pr_panels(panel_run_uuid)`)
 	return err
 }
 

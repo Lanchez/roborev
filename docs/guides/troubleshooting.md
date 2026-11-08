@@ -159,6 +159,11 @@ attempts and waits. A server-required delay beyond the remaining budget surfaces
 the failure without retrying early. Writes such as comments and commit statuses
 are not retried.
 
+Secondary rate limits pause reads and writes across clients for the same
+credential and GitHub server. `Retry-After` takes precedence; otherwise, the
+pause lasts one minute. Requests during the pause fail with
+`rate limit cooldown` without contacting GitHub.
+
 Retry messages appear in `daemon.log`, including transient failures that
 recover. If all attempts fail, CI health and `errors.log` retain the failed
 operation and a safe category, such as `list pull requests: timeout` or
@@ -167,6 +172,9 @@ credentials are excluded from these summaries. Other failure details remain in
 the daemon log. The next successful poll clears the current failure and
 preserves error history; discovery continues to use previously known
 repositories when available.
+
+A failed lookup retries after 15 minutes, then 30, then hourly, so a token or
+access fix appears on the first poll after that window.
 
 Check the operation and category before changing configuration. For HTTP 401 or
 403, check the CI credential and its repository permissions. For rate limits,

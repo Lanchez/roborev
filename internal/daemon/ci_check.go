@@ -156,7 +156,7 @@ func (wp *WorkerPool) runCICheck(ctx context.Context, job *storage.ReviewJob, cf
 				root := filepath.Dir(run.Job.WorkDir)
 				rewriteJob := run.Job
 				rewriteJob.WorkDir = filepath.Join(root, "rewrite")
-				rewriteJob.Env = append(slices.Clone(run.Job.Env), "TMPDIR="+rewriteJob.WorkDir, "GOCACHE="+filepath.Join(rewriteJob.WorkDir, "gocache"))
+				rewriteJob.Env = append(slices.Clone(run.Job.Env), "TMPDIR="+rewriteJob.WorkDir, "GOCACHE="+filepath.Join(rewriteJob.WorkDir, "gocache"), "MISE_STATE_DIR="+filepath.Join(rewriteJob.WorkDir, "mise-state"), "MISE_SYSTEM_DIR="+filepath.Join(rewriteJob.WorkDir, "mise-system"))
 				var err error
 				repo, _, err = cloneCICheckRepo(ctx, job.RepoPath, run.checkout, filepath.Join(root, "rewrite-source"))
 				if err != nil {
@@ -216,7 +216,7 @@ func (wp *WorkerPool) prepareCICheck(ctx context.Context, job *storage.ReviewJob
 	run.Command = command
 	readPaths := []string{codexDir}
 	toolPath := os.Getenv("PATH")
-	miseRoots, miseBins := ciCheckMisePaths(ctx, out)
+	miseRoots, miseBins, miseData := ciCheckMisePaths(ctx, out)
 	readPaths = append(readPaths, miseRoots...)
 	if len(miseBins) > 0 {
 		toolPath = strings.Join(miseBins, string(os.PathListSeparator)) + string(os.PathListSeparator) + toolPath
@@ -233,6 +233,7 @@ func (wp *WorkerPool) prepareCICheck(ctx context.Context, job *storage.ReviewJob
 		return
 	}
 	readPaths = append(readPaths, goPaths...)
+	pythonBin := prepareCICheckPackages(ctx, run.Repo, root, toolPath, gitEnv, out)
 	if err = validateCICheckReadPaths(readPaths); err != nil {
 		return
 	}
@@ -251,9 +252,15 @@ func (wp *WorkerPool) prepareCICheck(ctx context.Context, job *storage.ReviewJob
 		return
 	}
 	env := []string{"PATH=" + toolPath, "HOME=" + filepath.Join(root, "home"), "TMPDIR=" + filepath.Join(tmpAlias, "t"), "GOCACHE=" + filepath.Join(run.Job.WorkDir, "gocache"), "GOPROXY=off", "LANG=C.UTF-8", "TERM=dumb"}
+	if miseData != "" {
+		env = append(env, "MISE_DATA_DIR="+miseData, "MISE_STATE_DIR="+filepath.Join(run.Job.WorkDir, "mise-state"), "MISE_SYSTEM_DIR="+filepath.Join(run.Job.WorkDir, "mise-system"), "MISE_CEILING_PATHS="+root)
+	}
 	if len(goPaths) == 2 {
 		env[0] = "PATH=" + filepath.Join(goPaths[0], "bin") + string(os.PathListSeparator) + toolPath
 		env = append(env, "GOMODCACHE="+goPaths[1])
+	}
+	if pythonBin != "" {
+		env[0] = "PATH=" + pythonBin + string(os.PathListSeparator) + strings.TrimPrefix(env[0], "PATH=")
 	}
 	// nono protects HOME/.nono, so HOME sits outside its writable grant.
 	for _, dir := range []string{filepath.Join(root, "home"), filepath.Join(run.Job.WorkDir, "tmp"), filepath.Join(run.Job.WorkDir, "gocache")} {
@@ -324,29 +331,31 @@ func validateCICheckReadPaths(paths []string) error {
 }
 
 // Discover host-selected tools before the sandbox substitutes a disposable HOME.
-func ciCheckMisePaths(ctx context.Context, out io.Writer) (roots, bins []string) {
+func ciCheckMisePaths(ctx context.Context, out io.Writer) (roots, bins []string, dataDir string) {
 	mise, err := exec.LookPath("mise")
 	if errors.Is(err, exec.ErrNotFound) {
-		return nil, nil
+		return nil, nil, ""
 	}
 	if err == nil {
 		mise, err = sandbox.ResolvePath(mise)
 	}
 	if err != nil {
 		fmt.Fprintf(out, "CI checker mise discovery failed: %v\n", err)
-		return nil, nil
+		return nil, nil, ""
 	}
 	var results [][]byte
-	for _, args := range [][]string{{"ls", "--current", "--installed", "--json"}, {"bin-paths"}} {
-		cmd := exec.CommandContext(ctx, mise, args...)
+	for _, args := range [][]string{{"ls", "--current", "--installed", "--json"}, {"bin-paths"}, {"doctor", "--json"}} {
+		cmd := HiddenCommand(ctx, mise, args...)
 		// Temporary directory ancestors can contain mise config; select global host tools from /.
 		cmd.Dir = "/"
 		var stderr strings.Builder
 		cmd.Stderr = &stderr
 		data, err := cmd.Output()
-		if err != nil {
+		// doctor still reports directories when its diagnostic checks fail.
+		var exitErr *exec.ExitError
+		if err != nil && (args[0] != "doctor" || !errors.As(err, &exitErr)) {
 			fmt.Fprintf(out, "CI checker mise discovery failed: %v: %s\n", err, stderr.String())
-			return nil, nil
+			return nil, nil, ""
 		}
 		results = append(results, data)
 	}
@@ -355,7 +364,25 @@ func ciCheckMisePaths(ctx context.Context, out io.Writer) (roots, bins []string)
 	}
 	if err := json.Unmarshal(results[0], &inventory); err != nil {
 		fmt.Fprintf(out, "CI checker mise discovery failed: %v\n", err)
-		return nil, nil
+		return nil, nil, ""
+	}
+	var doctor struct {
+		Dirs struct {
+			Data string `json:"data"`
+		} `json:"dirs"`
+	}
+	if err := json.Unmarshal(results[2], &doctor); err != nil {
+		fmt.Fprintf(out, "CI checker mise discovery failed: %v\n", err)
+		doctor.Dirs.Data = ""
+	}
+	roots = append(roots, mise)
+	if doctor.Dirs.Data != "" {
+		installs, err := sandbox.ResolvePath(filepath.Join(doctor.Dirs.Data, "installs"))
+		if err != nil {
+			fmt.Fprintf(out, "CI checker mise discovery failed: %v\n", err)
+		} else {
+			roots = append(roots, installs)
+		}
 	}
 	for _, versions := range inventory {
 		for _, version := range versions {
@@ -378,7 +405,7 @@ func ciCheckMisePaths(ctx context.Context, out io.Writer) (roots, bins []string)
 		}
 		bins = append(bins, bin)
 	}
-	return roots, bins
+	return roots, bins, doctor.Dirs.Data
 }
 
 func warmGoModules(ctx context.Context, checkout string, gitEnv []string, out io.Writer) ([]string, error) {
@@ -405,7 +432,7 @@ func warmGoModules(ctx context.Context, checkout string, gitEnv []string, out io
 			return nil, fmt.Errorf("checker root %s must be a regular file", name)
 		}
 	}
-	goEnv := exec.CommandContext(ctx, "go", "env", "GOROOT", "GOMODCACHE")
+	goEnv := HiddenCommand(ctx, "go", "env", "GOROOT", "GOMODCACHE")
 	// Resolve Go globally without loading checkout or temporary directory ancestor config.
 	goEnv.Dir = "/"
 	var stderr strings.Builder
@@ -423,7 +450,7 @@ func warmGoModules(ctx context.Context, checkout string, gitEnv []string, out io
 	if err := os.MkdirAll(paths[1], 0o755); err != nil {
 		return nil, fmt.Errorf("create checker module cache: %w", err)
 	}
-	warm := exec.CommandContext(ctx, filepath.Join(paths[0], "bin", "go"), "mod", "download")
+	warm := HiddenCommand(ctx, filepath.Join(paths[0], "bin", "go"), "mod", "download")
 	warm.Dir = checkout
 	warm.Env = gitEnv
 	if output, err := warm.CombinedOutput(); err != nil {

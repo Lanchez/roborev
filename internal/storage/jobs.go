@@ -1663,7 +1663,9 @@ func (db *DB) ReenqueueJobWithRequest(
 
 	// Reset job status and replace effective execution settings with the
 	// newly resolved values for this rerun. Clear prompt_prebuilt and prompt
-	// only for review jobs so they rebuild from current git/config state.
+	// for ordinary review jobs so they rebuild from current git/config state.
+	// A caller-supplied review prompt cannot be regenerated from the checkout.
+	// Restore its prebuilt flag from source because sync does not carry the flag.
 	// Stored-prompt jobs (task, compact, fix, insights, goal_review) keep their prompt
 	// since the worker needs it and cannot regenerate it from git.
 	//
@@ -1688,7 +1690,7 @@ func (db *DB) ReenqueueJobWithRequest(
 		    backup_agent = CASE WHEN ? THEN ? WHEN budget_original_agent != '' THEN budget_original_backup_agent ELSE backup_agent END,
 		    backup_model = CASE WHEN ? THEN ? WHEN budget_original_agent != '' THEN budget_original_backup_model ELSE backup_model END,
 		    budget_original_agent = '', budget_original_backup_agent = '', budget_original_backup_model = '',
-		    prompt_prebuilt = 0,
+		    prompt_prebuilt = CASE WHEN source = ? THEN 1 ELSE 0 END,
 		    skip_reason = NULL,
 		    updated_at = ?
 		WHERE id = ?
@@ -1704,6 +1706,7 @@ func (db *DB) ReenqueueJobWithRequest(
 		opts.RestorePlan, normalizeMinSeverityForWrite(opts.MinSeverity),
 		opts.RestorePlan, opts.BackupAgent,
 		opts.RestorePlan, opts.BackupModel,
+		JobSourceReviewPrompt,
 		updatedAt, jobID)
 	if err != nil {
 		return 0, false, err
@@ -1720,8 +1723,9 @@ func (db *DB) ReenqueueJobWithRequest(
 		SET patch = NULL,
 		    prompt = CASE WHEN (SELECT job_type FROM review_jobs WHERE id = job_content.job_id)
 		                  IN ('task', 'compact', 'fix', 'insights', 'goal_review')
+		                  OR (SELECT source FROM review_jobs WHERE id = job_content.job_id) = ?
 		             THEN prompt ELSE NULL END
-		WHERE job_id = ?`, jobID); err != nil {
+		WHERE job_id = ?`, JobSourceReviewPrompt, jobID); err != nil {
 		return 0, false, fmt.Errorf("reset job %d content: %w", jobID, err)
 	}
 	if requestID != uuid.Nil() {
@@ -1950,6 +1954,8 @@ type listJobsOptions struct {
 	branchEmpty        bool
 	branchIncludeEmpty bool
 	closed             *bool
+	closedJobColumn    bool
+	includeTotals      bool
 	openFailedReviews  bool
 	jobType            string
 	excludeJobType     string
@@ -1968,6 +1974,16 @@ type listJobsOptions struct {
 	omitPrompt         bool
 	includeFindings    bool
 	failedReviewsSince *time.Time
+}
+
+// selective reports whether a filter can seek jobs through its own index
+// instead of walking every closed job in enqueue order.
+func (o listJobsOptions) selective(statusFilter, repoFilter string) bool {
+	// Repository sets, prefixes, and branch disjunctions cannot read one index
+	// range in enqueue order, so closed pages need the closed-position index.
+	// Done status does not narrow closed reviews, which belong to done jobs.
+	return (statusFilter != "" && statusFilter != string(JobStatusDone)) || repoFilter != "" || len(o.repoPaths) == 1 || len(o.repoIDs) == 1 ||
+		(o.branch != "" && !o.branchEmpty && !o.branchIncludeEmpty) || o.gitRef != "" || o.panelRun != uuid.Nil()
 }
 
 // WithFailedReviewsSince selects completed review, range, dirty, or synthesis
@@ -2033,6 +2049,11 @@ func WithOpenFailedReviews() ListJobsOption {
 // the TUI prompt view renders it straight from list rows.
 func WithoutPrompt() ListJobsOption {
 	return func(o *listJobsOptions) { o.omitPrompt = true }
+}
+
+// WithJobTotals includes total jobs and distinct repositories in aggregate stats.
+func WithJobTotals() ListJobsOption {
+	return func(o *listJobsOptions) { o.includeTotals = true }
 }
 
 // WithFindingCounts requests the nullable finding-count projection for listed jobs.
@@ -2133,7 +2154,7 @@ func findingCountsDiffContentExpr(includeFindings bool) string {
 			THEN ` + jobDiffExpr + ` ELSE NULL END`
 }
 
-func buildJobFilterClause(statusFilter, repoFilter string, o listJobsOptions) (string, []any) {
+func buildJobFilterClause(statusFilter, repoFilter string, o listJobsOptions, enqueueOrder bool) (string, []any) {
 	var args []any
 	var conditions []string
 	if o.openFailedReviews {
@@ -2143,7 +2164,13 @@ func buildJobFilterClause(statusFilter, repoFilter string, o listJobsOptions) (s
 	}
 
 	if statusFilter != "" {
-		conditions = append(conditions, "j.status = ?")
+		statusColumn := "j.status"
+		if statusFilter == string(JobStatusDone) && enqueueOrder {
+			// Done usually matches most jobs. Disqualify the status index so
+			// SQLite can walk enqueue positions and stop when the page is full.
+			statusColumn = "+j.status"
+		}
+		conditions = append(conditions, statusColumn+" = ?")
 		args = append(args, statusFilter)
 	}
 	if o.failedReviewsSince != nil {
@@ -2224,9 +2251,17 @@ func buildJobFilterClause(statusFilter, repoFilter string, o listJobsOptions) (s
 	}
 	if o.closed != nil {
 		if *o.closed {
-			conditions = append(conditions, "rv.closed = 1")
+			if o.closedJobColumn {
+				conditions = append(conditions, "j.review_closed = 1")
+			} else {
+				conditions = append(conditions, "rv.closed = 1")
+			}
 		} else {
-			conditions = append(conditions, "(rv.closed IS NULL OR rv.closed = 0)")
+			if o.closedJobColumn {
+				conditions = append(conditions, "j.review_closed = 0")
+			} else {
+				conditions = append(conditions, "(rv.closed IS NULL OR rv.closed = 0)")
+			}
 			// Failed and canceled jobs never produce a review to resolve, so
 			// they are not open. An explicit status filter wins: asking for
 			// failed jobs with the open filter on must still list them.
@@ -2311,8 +2346,16 @@ func listJobsQuery(statusFilter, repoFilter string, limit, offset int, options l
 	for i, expr := range sortKeys {
 		fmt.Fprintf(&sortKeyColumns, ",\n\t\t       %s AS sort_key_%d", expr, i)
 	}
+	enqueueOrder := options.sort.Column == "" || options.sort.Column == JobSortEnqueuedAt
+	queryFilters, filterArgs := buildJobFilterClause(statusFilter, repoFilter, options, enqueueOrder)
 	jobsTable := "review_jobs j"
-	if options.openFailedReviews {
+	if options.closed != nil && *options.closed && (options.sort.Column == "" || options.sort.Column == JobSortEnqueuedAt) &&
+		!options.selective(statusFilter, repoFilter) {
+		// Closed-position pages skip open history. Selectively filtered pages keep
+		// their own repo, branch, ref, panel, status, or finished-time index.
+		jobsTable += " INDEXED BY idx_review_jobs_closed_position"
+		queryFilters += " AND j.review_closed = 1"
+	} else if options.openFailedReviews {
 		// Without statistics, SQLite otherwise scans the repo's job index.
 		// NOT INDEXED keeps rowid lookups driven by the failed-review IN list.
 		jobsTable += " NOT INDEXED"
@@ -2334,7 +2377,6 @@ func listJobsQuery(statusFilter, repoFilter string, limit, offset int, options l
 		LEFT JOIN job_content jc ON jc.job_id = j.id
 		LEFT JOIN reviews rv ON rv.job_id = j.id
 	`
-	queryFilters, filterArgs := buildJobFilterClause(statusFilter, repoFilter, options)
 	args := append(slices.Clone(sortKeyArgs), filterArgs...)
 	query += queryFilters
 
@@ -2416,6 +2458,9 @@ func (db *DB) ListJobs(statusFilter string, repoFilter string, limit, offset int
 // GetJobByID returns a job by ID with joined fields
 // JobStats holds aggregate counts for the queue status line.
 type JobStats struct {
+	Total     *int `json:"total,omitempty"`
+	RepoCount *int `json:"repo_count,omitempty"`
+
 	Queued   int `json:"queued"`
 	Running  int `json:"running"`
 	Done     int `json:"done"`
@@ -2432,6 +2477,8 @@ func (db *DB) CountJobStats(statusFilter, repoFilter string, opts ...ListJobsOpt
 	query, args := jobStatsQuery(statusFilter, repoFilter, opts...)
 	var stats JobStats
 	err := db.QueryRow(query, args...).Scan(
+		&stats.Total,
+		&stats.RepoCount,
 		&stats.Queued,
 		&stats.Running,
 		&stats.Done,
@@ -2445,23 +2492,28 @@ func (db *DB) CountJobStats(statusFilter, repoFilter string, opts ...ListJobsOpt
 }
 
 func jobStatsQuery(statusFilter, repoFilter string, opts ...ListJobsOption) (string, []any) {
-	// The unique job_id index still reads closed past each review's prompt.
-	// Use the covering metadata index, as the analytics query does.
+	o := collectListJobsOptions(opts...)
+	o.closedJobColumn = true
+	totals := "NULL, NULL,"
+	if o.includeTotals {
+		totals = "COUNT(*), COUNT(DISTINCT j.repo_id),"
+	}
 	query := `
-		SELECT
+		SELECT ` + totals + `
 			COALESCE(SUM(CASE WHEN j.status = 'queued' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN j.status = 'running' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN j.status = 'done' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN j.status = 'failed' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN j.status = 'canceled' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN j.status = 'skipped' THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN j.status = 'done' AND rv.closed = 1 THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN j.status = 'done' AND (rv.closed IS NULL OR rv.closed = 0) THEN 1 ELSE 0 END), 0)
+			COALESCE(SUM(CASE WHEN j.status = 'done' AND j.review_closed = 1 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN j.status = 'done' AND j.review_closed = 0 THEN 1 ELSE 0 END), 0)
 		FROM review_jobs j
-		JOIN repos r ON r.id = j.repo_id
-		LEFT JOIN reviews rv INDEXED BY idx_reviews_job_verdict ON rv.job_id = j.id
 	`
-	queryFilters, args := buildJobFilterClause(statusFilter, repoFilter, collectListJobsOptions(opts...))
+	if repoFilter != "" || len(o.repoPaths) > 0 || o.repoPrefix != "" {
+		query += " JOIN repos r ON r.id = j.repo_id"
+	}
+	queryFilters, args := buildJobFilterClause(statusFilter, repoFilter, o, false)
 	return query + queryFilters, args
 }
 
@@ -2577,6 +2629,7 @@ func (db *DB) UpdateJobBranch(jobID int64, branch string) (int64, error) {
 // oldSHA in a repo, used after rebases to preserve review history.
 // If a job has a stored patch_id that differs from the provided one,
 // that job is skipped (the commit's content changed).
+// Supplied-prompt reviews keep their original revision even for identical patches.
 // Returns the number of rows updated.
 func (db *DB) RemapJobGitRef(
 	repoID int64, oldSHA, newSHA, patchID string, newCommitID int64,
@@ -2587,8 +2640,9 @@ func (db *DB) RemapJobGitRef(
 		SET git_ref = ?, commit_id = ?, patch_id = ?, updated_at = ?
 		WHERE git_ref = ? AND repo_id = ?
 		AND status != 'running'
+		AND COALESCE(source, '') != ?
 		AND (patch_id IS NULL OR patch_id = '' OR patch_id = ?)
-	`, newSHA, newCommitID, nullString(patchID), now, oldSHA, repoID, patchID)
+	`, newSHA, newCommitID, nullString(patchID), now, oldSHA, repoID, JobSourceReviewPrompt, patchID)
 	if err != nil {
 		return 0, fmt.Errorf("remap job git_ref: %w", err)
 	}
@@ -2602,6 +2656,7 @@ func (db *DB) RemapJobGitRef(
 // RemapJob atomically checks for matching jobs, creates the commit
 // row, and updates git_ref — all in a single transaction to prevent
 // orphan commit rows or races between concurrent remaps.
+// Supplied-prompt reviews keep their original revision even for identical patches.
 func (db *DB) RemapJob(
 	repoID int64, oldSHA, newSHA, patchID string,
 	author, subject string, timestamp time.Time,
@@ -2617,8 +2672,9 @@ func (db *DB) RemapJob(
 		SELECT COUNT(*) FROM review_jobs
 		WHERE git_ref = ? AND repo_id = ?
 		AND status != 'running'
+		AND COALESCE(source, '') != ?
 		AND (patch_id IS NULL OR patch_id = '' OR patch_id = ?)
-	`, oldSHA, repoID, patchID).Scan(&matchCount)
+	`, oldSHA, repoID, JobSourceReviewPrompt, patchID).Scan(&matchCount)
 	if err != nil {
 		return 0, fmt.Errorf("count matching jobs: %w", err)
 	}
@@ -2652,9 +2708,10 @@ func (db *DB) RemapJob(
 		SET git_ref = ?, commit_id = ?, patch_id = ?, updated_at = ?
 		WHERE git_ref = ? AND repo_id = ?
 		AND status != 'running'
+		AND COALESCE(source, '') != ?
 		AND (patch_id IS NULL OR patch_id = '' OR patch_id = ?)
 	`, newSHA, commitID, nullString(patchID), now,
-		oldSHA, repoID, patchID)
+		oldSHA, repoID, JobSourceReviewPrompt, patchID)
 	if err != nil {
 		return 0, fmt.Errorf("remap job git_ref: %w", err)
 	}
